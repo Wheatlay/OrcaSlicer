@@ -2018,10 +2018,14 @@ Response Controller::handle_cut_object(uint64_t id, const std::string &body)
             mo->cut_id.increase_connectors_cnt(dowels.size());
 
         const bool has_dowels = !dowels.empty();
-        ModelObjectCutAttributes attributes = ModelObjectCutAttribute::KeepUpper | ModelObjectCutAttribute::KeepLower;
-        if (place_on_cut) attributes |= ModelObjectCutAttribute::PlaceOnCutUpper | ModelObjectCutAttribute::PlaceOnCutLower;
-        if (has_dowels)   attributes |= ModelObjectCutAttribute::CreateDowels;
-        if (!has_dowels && mo->cut_id.id().invalid()) attributes |= ModelObjectCutAttribute::InvalidateCutInfo;
+        // one expression with only_if(), as GLGizmoCut3D::perform_cut builds it
+        // (enum_bitmask's |= does not compile for this enum)
+        const ModelObjectCutAttributes attributes =
+            ModelObjectCutAttribute::KeepUpper | ModelObjectCutAttribute::KeepLower |
+            only_if(place_on_cut, ModelObjectCutAttribute::PlaceOnCutUpper) |
+            only_if(place_on_cut, ModelObjectCutAttribute::PlaceOnCutLower) |
+            only_if(has_dowels, ModelObjectCutAttribute::CreateDowels) |
+            only_if(!has_dowels && mo->cut_id.id().invalid(), ModelObjectCutAttribute::InvalidateCutInfo);
         api_update_object_cut_id(mo->cut_id, attributes, (int) dowels.size());
 
         Cut cut(mo, instance, cut_matrix, attributes);
