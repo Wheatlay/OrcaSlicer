@@ -1262,7 +1262,9 @@ Response Controller::handle_load_model(const std::string &body)
         for (size_t i : idxs) {
             const ModelObject *mo = plater->model().objects[i];
             auto sz = mo->bounding_box_exact().size();
-            objects.push_back({{"index", i}, {"name", mo->name},
+            // "id" is the stable object id the /objects/{id}/... routes take, so a
+            // caller can act on what it just loaded without listing every object.
+            objects.push_back({{"index", i}, {"id", (uint64_t) mo->id().id}, {"name", mo->name},
                                {"size_mm", {sz.x(), sz.y(), sz.z()}}});
         }
         return {{"loaded", true}, {"objects", objects}};
