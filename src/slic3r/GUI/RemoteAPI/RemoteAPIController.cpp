@@ -9,6 +9,8 @@
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/Model.hpp"    // M4b: ModelObject/ModelInstance for GET /objects
+#include "libslic3r/CutUtils.hpp"       // POST /objects/{id}/cut
+#include "libslic3r/TriangleMesh.hpp"   // its_make_cylinder, its_num_open_edges
 #include "slic3r/GUI/NotificationManager.hpp" // in-app change notifications
 #include "libslic3r/AppConfig.hpp"             // remote_api_notify toggle
 #include "slic3r/GUI/Tab.hpp"
@@ -1907,6 +1909,160 @@ Response Controller::handle_transform_object(uint64_t id, const std::string &bod
     return { 200, r };
 }
 
+// POST /api/v1/objects/{id}/cut
+// body {"plane":{"point":[x,y,z],"normal":[nx,ny,nz]}, "instance":0, "place_on_cut":true,
+//       "connectors":[{"pos":[x,y,z], "radius":2.5, "height":8,
+//                      "radius_tolerance":0.1, "height_tolerance":0.1}]}
+// Cuts one object with a plane, like the Cut gizmo (GLGizmoCut3D::perform_cut) but with no
+// dialog: it follows Plater::cut_horizontal (used by the calibration prints) with a full plane
+// matrix. point/pos are world (bed) coordinates; connectors are round dowels (v1), each a hole
+// in both halves plus a separate dowel object. Open edges left by the cut are reported in
+// "warnings" instead of asking to repair (the repair routine needs a progress dialog).
+// Response: {"cut":true, "objects":[{"id","name","size_mm"}...], "dowels":n, "warnings":[...]}
+static void api_update_object_cut_id(CutObjectBase &cut_id, ModelObjectCutAttributes attributes, int dowels_count)
+{
+    // copy of update_object_cut_id() in GLGizmoCut.cpp (a free function without a header)
+    if (!attributes.has(ModelObjectCutAttribute::KeepUpper) ||
+        !attributes.has(ModelObjectCutAttribute::KeepLower) ||
+        attributes.has(ModelObjectCutAttribute::InvalidateCutInfo))
+        return;
+    if (cut_id.id().invalid())
+        cut_id.init();
+    int cut_obj_cnt = -1;
+    if (attributes.has(ModelObjectCutAttribute::KeepUpper))    cut_obj_cnt++;
+    if (attributes.has(ModelObjectCutAttribute::KeepLower))    cut_obj_cnt++;
+    if (attributes.has(ModelObjectCutAttribute::CreateDowels)) cut_obj_cnt += dowels_count;
+    if (cut_obj_cnt > 0)
+        cut_id.increase_check_sum(size_t(cut_obj_cnt));
+}
+
+Response Controller::handle_cut_object(uint64_t id, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body); // parse_error -> 400 in dispatch
+    if (!in.is_object() || !in.contains("plane") || !in["plane"].is_object())
+        return { 400, {{"error", "missing_plane"}} };
+    auto read_vec = [](const nlohmann::json &j, const char *k, Vec3d &out) -> bool {
+        if (!j.contains(k) || !j[k].is_array() || j[k].size() != 3) return false;
+        for (int i = 0; i < 3; ++i) {
+            if (!j[k][i].is_number()) return false;
+            out[i] = j[k][i].get<double>();
+        }
+        return true;
+    };
+    Vec3d point, normal;
+    if (!read_vec(in["plane"], "point", point) || !read_vec(in["plane"], "normal", normal))
+        return { 400, {{"error", "bad_plane"}, {"detail", "plane needs point [x,y,z] and normal [x,y,z]"}} };
+    if (normal.norm() < 1e-9)
+        return { 400, {{"error", "zero_normal"}} };
+    normal.normalize();
+    const int  instance     = in.value("instance", 0);
+    const bool place_on_cut = in.value("place_on_cut", true);
+
+    struct Dowel { Vec3d pos; float radius, height, r_tol, h_tol; };
+    std::vector<Dowel> dowels;
+    if (in.contains("connectors")) {
+        if (!in["connectors"].is_array()) return { 400, {{"error", "bad_connectors"}} };
+        for (const auto &c : in["connectors"]) {
+            Dowel d;
+            if (!c.is_object() || !read_vec(c, "pos", d.pos))
+                return { 400, {{"error", "bad_connector"}, {"detail", "each connector needs pos [x,y,z]"}} };
+            d.radius = c.value("radius", 2.5f);
+            d.height = c.value("height", 8.0f);
+            d.r_tol  = c.value("radius_tolerance", 0.1f);
+            d.h_tol  = c.value("height_tolerance", 0.1f);
+            if (!(d.radius > 0.f) || !(d.height > 0.f) || d.r_tol < 0.f || d.r_tol > 1.f || d.h_tol < 0.f || d.h_tol > 1.f)
+                return { 400, {{"error", "bad_connector"}, {"detail", "radius/height > 0, tolerances 0..1"}} };
+            dowels.push_back(d);
+        }
+    }
+
+    nlohmann::json r = run_on_ui([=]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        Model  &model  = plater->model();
+        int idx = find_object_index(model, id);
+        if (idx < 0) { api_notify("Object not found", true); return {{"error", "unknown_object"}}; }
+        ModelObject *mo = model.objects[idx];
+        if (instance < 0 || instance >= (int) mo->instances.size()) return {{"error", "bad_instance"}};
+
+        // Same frame as GLGizmoCut3D::get_cut_matrix: world minus the instance offset,
+        // rotated so that +Z is the plane normal.
+        const Vec3d       inst_offset = mo->instances[instance]->get_offset();
+        const Transform3d rotation_m(Eigen::Quaterniond::FromTwoVectors(Vec3d::UnitZ(), normal));
+        const Transform3d cut_matrix = Geometry::translation_transform(point - inst_offset) * rotation_m;
+
+        // The plane has to cross the object, otherwise one side would be empty.
+        const BoundingBoxf3 bb = mo->instance_bounding_box((size_t) instance);
+        int above = 0, below = 0;
+        for (int i = 0; i < 8; ++i) {
+            Vec3d c((i & 1) ? bb.max.x() : bb.min.x(), (i & 2) ? bb.max.y() : bb.min.y(), (i & 4) ? bb.max.z() : bb.min.z());
+            double d = normal.dot(c - point);
+            if (d > 1e-6) ++above; else if (d < -1e-6) ++below;
+        }
+        if (above == 0 || below == 0) return {{"error", "plane_misses_object"}};
+
+        Plater::TakeSnapshot snapshot(plater, "Cut by API");
+
+        // Dowels, as GLGizmoCut3D::apply_connectors_in_model + apply_cut_connectors do it:
+        // a negative volume per dowel (twice the depth, centred on the plane) so both halves
+        // get a hole; Cut then also creates the separate dowel objects.
+        size_t connector_id = mo->cut_id.connectors_cnt();
+        for (const Dowel &d : dowels) {
+            TriangleMesh mesh(its_make_cylinder(1.0, 1.0, 2 * PI / 360)); // centred when added
+            ModelVolume *vol = mo->add_volume(std::move(mesh), ModelVolumeType::NEGATIVE_VOLUME);
+            vol->set_transformation(Geometry::translation_transform(d.pos - inst_offset) * rotation_m *
+                                    Geometry::scale_transform(Vec3d(d.radius, d.radius, 2.0 * d.height)));
+            vol->cut_info = { CutConnectorType::Dowel, d.r_tol, d.h_tol };
+            vol->name = "Connector-" + std::to_string(++connector_id);
+        }
+        if (!dowels.empty())
+            mo->cut_id.increase_connectors_cnt(dowels.size());
+
+        const bool has_dowels = !dowels.empty();
+        ModelObjectCutAttributes attributes = ModelObjectCutAttribute::KeepUpper | ModelObjectCutAttribute::KeepLower;
+        if (place_on_cut) attributes |= ModelObjectCutAttribute::PlaceOnCutUpper | ModelObjectCutAttribute::PlaceOnCutLower;
+        if (has_dowels)   attributes |= ModelObjectCutAttribute::CreateDowels;
+        if (!has_dowels && mo->cut_id.id().invalid()) attributes |= ModelObjectCutAttribute::InvalidateCutInfo;
+        api_update_object_cut_id(mo->cut_id, attributes, (int) dowels.size());
+
+        Cut cut(mo, instance, cut_matrix, attributes);
+        const ModelObjectPtrs new_objects = cut.perform_with_plane();
+        if (new_objects.empty()) return {{"error", "cut_failed"}};
+
+        nlohmann::json warnings = nlohmann::json::array();
+        for (const ModelObject *o : new_objects)
+            for (const ModelVolume *v : o->volumes)
+                if (size_t open = its_num_open_edges(v->mesh().its); open > 0)
+                    warnings.push_back(o->name + ": " + std::to_string(open) +
+                                       " open edges after the cut (repair it in Orca if slicing complains)");
+
+        const CutObjectBase cut_id = mo->cut_id;
+        const size_t n_new = new_objects.size();
+        plater->apply_cut_object_to_model((size_t) idx, new_objects); // deletes mo
+        // synchronize_model_after_cut (GLGizmoCut.cpp), copied: keep cut ids of the pieces in step
+        for (ModelObject *obj : model.objects)
+            if (obj->is_cut() && obj->cut_id.has_same_id(cut_id) && !obj->cut_id.is_equal(cut_id))
+                obj->cut_id.copy(cut_id);
+
+        // apply_cut_object_to_model appends the new objects at the end of the list
+        nlohmann::json objects = nlohmann::json::array();
+        for (size_t i = model.objects.size() - n_new; i < model.objects.size(); ++i) {
+            const ModelObject *o = model.objects[i];
+            auto sz = o->bounding_box_exact().size();
+            objects.push_back({{"id", (uint64_t) o->id().id}, {"name", o->name},
+                               {"size_mm", {sz.x(), sz.y(), sz.z()}}});
+        }
+        api_notify("Cut into " + std::to_string(n_new) + " objects");
+        return {{"cut", true}, {"objects", objects}, {"dowels", dowels.size()}, {"warnings", warnings}};
+    }, /*timeout_s=*/60); // a big helmet shell can take longer than the default 10 s
+    if (r.contains("error")) {
+        const std::string e = r["error"].get<std::string>();
+        if (e == "unknown_object") return { 404, r };
+        if (e == "plane_misses_object" || e == "cut_failed" || e == "bad_instance") return { 422, r };
+        return { 500, r };
+    }
+    return { 200, r };
+}
+
 Response Controller::handle_duplicate_object(uint64_t id)
 {
     nlohmann::json r = run_on_ui([id]() -> nlohmann::json {
@@ -2395,6 +2551,11 @@ Response Controller::dispatch(const Request &req)
                 }
                 if (req.method == "POST" && action == "duplicate")
                     return handle_duplicate_object(oid);
+                if (req.method == "POST" && action == "cut") {
+                    try { return handle_cut_object(oid, req.body); }
+                    catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
+                    catch (const nlohmann::json::type_error &)  { return { 400, {{"error", "bad_field_type"}} }; }
+                }
                 if (req.method == "POST" && action == "plate") {
                     try { return handle_put_object_plate(oid, req.body); }
                     catch (const nlohmann::json::parse_error &) { return { 400, {{"error", "invalid_json"}} }; }
