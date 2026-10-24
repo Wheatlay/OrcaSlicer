@@ -951,8 +951,11 @@ public:
     // Offscreen render of the plate as the user sees it: bed + plate grid +
     // models, framed on the build volume (so plate contact, bed position and
     // first-layer footprint are all readable). Returns false on FBO failure.
+    // yaw/pitch (degrees) orbit the camera around its target after the preset view is set,
+    // zoom multiplies the framed zoom (>1 = closer). Only the current plate's models are drawn.
     bool render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h,
-                                Camera::ViewAngleType camera_view_angle_type, bool frame_object);
+                                Camera::ViewAngleType camera_view_angle_type, bool frame_object,
+                                double yaw_deg = 0.0, double pitch_deg = 0.0, double zoom = 1.0);
     // Offscreen render of the sliced toolpaths (preview) into thumbnail_data.
     // Returns false when no toolpaths are loaded or the FBO cannot be built.
     bool render_gcode_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h,

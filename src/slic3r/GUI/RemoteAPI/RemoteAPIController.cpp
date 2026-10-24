@@ -1723,6 +1723,20 @@ Response Controller::handle_plate_render(const std::string &target)
     w = std::min(std::max(w, 64L), 2048L);
     h = std::min(std::max(h, 64L), 2048L);
 
+    // Free camera (editor view): yaw/pitch in degrees orbit around the framed target,
+    // zoom multiplies the framing (2 = twice as close).
+    double yaw = 0.0, pitch = 0.0, zoom = 1.0;
+    try {
+        const std::string ys = qparam("yaw"), ps = qparam("pitch"), zs = qparam("zoom");
+        if (!ys.empty()) yaw = std::stod(ys);
+        if (!ps.empty()) pitch = std::stod(ps);
+        if (!zs.empty()) zoom = std::stod(zs);
+    } catch (...) {
+        return { 400, {{"error", "bad_param"}, {"param", "yaw/pitch/zoom"}} };
+    }
+    if (!(zoom > 0.05 && zoom <= 20.0))
+        return { 400, {{"error", "bad_param"}, {"param", "zoom"}, {"detail", "0.05 < zoom <= 20"}} };
+
     const Camera::ViewAngleType va           = ait->second;
     const bool                  preview      = (view == "preview");
     const bool                  frame_object = frame.empty() ? preview : (frame == "object");
@@ -1731,7 +1745,7 @@ Response Controller::handle_plate_render(const std::string &target)
     auto png_out = std::make_shared<std::string>();
 
     // 30s (not the 10s default): a large plate at 2048px can outrun the default.
-    nlohmann::json j = run_on_ui([va, w, h, preview, frame_object, png_out]() -> nlohmann::json {
+    nlohmann::json j = run_on_ui([va, w, h, preview, frame_object, png_out, yaw, pitch, zoom]() -> nlohmann::json {
         Plater *plater = wxGetApp().plater();
         ThumbnailData data;
         if (preview) {
@@ -1751,7 +1765,7 @@ Response Controller::handle_plate_render(const std::string &target)
             }
         } else {
             GLCanvas3D *canvas = plater->get_view3D_canvas3D();
-            if (canvas == nullptr || !canvas->render_plate_thumbnail(data, (unsigned int)w, (unsigned int)h, va, frame_object))
+            if (canvas == nullptr || !canvas->render_plate_thumbnail(data, (unsigned int)w, (unsigned int)h, va, frame_object, yaw, pitch, zoom))
                 return {{"error", "render_failed"}, {"reason", "editor plate render failed"}};
         }
         size_t png_size = 0;

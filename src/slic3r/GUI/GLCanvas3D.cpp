@@ -6127,7 +6127,8 @@ static void debug_output_thumbnail(const ThumbnailData& thumbnail_data)
 #endif // ENABLE_THUMBNAIL_GENERATOR_DEBUG_OUTPUT
 
 bool GLCanvas3D::render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned int w, unsigned int h,
-                                        Camera::ViewAngleType camera_view_angle_type, bool frame_object)
+                                        Camera::ViewAngleType camera_view_angle_type, bool frame_object,
+                                        double yaw_deg, double pitch_deg, double zoom)
 {
     // Remote API: offscreen render of the current plate. Unlike render_thumbnail()
     // (which frames the objects and deliberately skips the bed - see
@@ -6143,9 +6144,16 @@ bool GLCanvas3D::render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned 
     // Content box = the models themselves. scene_box additionally covers anything
     // sitting above/outside the build volume, so a floating or off-bed object is
     // never silently cropped and the depth range always contains the bed.
+    // Only models standing on THIS plate: with several plates the others sit beside it
+    // and would pull the framing out to the whole project.
+    auto on_this_plate = [&plate_box](const GLVolume *vol) {
+        const Vec3d c = vol->transformed_bounding_box().center();
+        return c.x() >= plate_box.min.x() && c.x() <= plate_box.max.x() &&
+               c.y() >= plate_box.min.y() && c.y() <= plate_box.max.y();
+    };
     BoundingBoxf3 content_box;
     for (const GLVolume *vol : m_volumes.volumes) {
-        if (vol != nullptr && vol->is_active && !vol->is_modifier && !vol->is_wipe_tower)
+        if (vol != nullptr && vol->is_active && !vol->is_modifier && !vol->is_wipe_tower && on_this_plate(vol))
             content_box.merge(vol->transformed_bounding_box());
     }
     BoundingBoxf3 scene_box = plate_box;
@@ -6197,6 +6205,11 @@ bool GLCanvas3D::render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned 
         camera.set_viewport(0, 0, w, h);
         camera.select_view(camera_view_angle_type);
         camera.zoom_to_box(zoom_box);
+        // Free look for the API: orbit around the framed target, then zoom in/out.
+        if (yaw_deg != 0.0 || pitch_deg != 0.0)
+            camera.rotate_on_sphere(yaw_deg * PI / 180.0, pitch_deg * PI / 180.0, false);
+        if (zoom > 0.0 && zoom != 1.0)
+            camera.set_zoom(camera.get_zoom() * zoom);
         // Projection takes the FULL scene box: apply_projection() only uses it for
         // the near/far planes (the ortho extents come from the zoom above), so the
         // bed stays unclipped even when zoomed tight on the object.
@@ -6225,7 +6238,7 @@ bool GLCanvas3D::render_plate_thumbnail(ThumbnailData& thumbnail_data, unsigned 
             shader->set_uniform("emission_factor", 0.1f);
             shader->set_uniform("ban_light", false);
             for (GLVolume *vol : m_volumes.volumes) {
-                if (vol == nullptr || vol->is_modifier || vol->is_wipe_tower)
+                if (vol == nullptr || vol->is_modifier || vol->is_wipe_tower || !on_this_plate(vol))
                     continue;
                 vol->model.set_color(adjust_color_for_rendering(vol->color));
                 shader->set_uniform("volume_world_matrix", vol->world_matrix());
