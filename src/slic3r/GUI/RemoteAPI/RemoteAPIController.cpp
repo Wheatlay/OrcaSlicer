@@ -2334,6 +2334,57 @@ Response Controller::handle_select_plate(int index)
     return { 200, r };
 }
 
+// PUT /plates/{i}  body {"name": "..."} - names a plate (shown on the plate in the window and
+// saved in the .3mf), e.g. "13h24m 267g - shell 1+2, frame B" so a person sees what it is.
+Response Controller::handle_rename_plate(int index, const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("name") || !in["name"].is_string())
+        return { 400, {{"error", "missing_name"}} };
+    std::string name = in["name"].get<std::string>();
+    if (name.size() > 120) return { 400, {{"error", "name_too_long"}, {"max", 120}} };
+    nlohmann::json r = run_on_ui([index, name]() -> nlohmann::json {
+        PartPlateList &plates = wxGetApp().plater()->get_partplate_list();
+        if (index < 0 || index >= plates.get_plate_count())
+            return {{"error", "unknown_plate"}, {"count", plates.get_plate_count()}};
+        plates.get_plate(index)->set_plate_name(name);
+        wxGetApp().plater()->get_current_canvas3D()->set_as_dirty();
+        return {{"index", index}, {"name", name}};
+    });
+    if (r.contains("error")) return { 404, r };
+    return { 200, r };
+}
+
+// POST /project/save  body {"path": "C:/.../project.3mf"} - saves the whole project (all
+// plates, objects, poses, settings) as File > Save Project As would, without its file dialog.
+Response Controller::handle_save_project(const std::string &body)
+{
+    nlohmann::json in = nlohmann::json::parse(body);
+    if (!in.is_object() || !in.contains("path") || !in["path"].is_string())
+        return { 400, {{"error", "missing_path"}} };
+    std::string path = in["path"].get<std::string>();
+    std::string lower = path;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+    if (lower.size() < 4 || lower.compare(lower.size() - 4, 4, ".3mf") != 0)
+        return { 400, {{"error", "path_must_end_with_3mf"}} };
+    nlohmann::json r = run_on_ui([path]() -> nlohmann::json {
+        Plater *plater = wxGetApp().plater();
+        if (plater->model().objects.empty()) return {{"error", "nothing_to_save"}};
+        if (plater->is_background_process_slicing()) return {{"error", "slicing"}};
+        const int ret = plater->export_3mf(boost::filesystem::path(path));
+        if (ret < 0) return {{"error", "save_failed"}, {"code", ret}};
+        boost::system::error_code ec;
+        const auto bytes = boost::filesystem::file_size(path, ec);
+        api_notify("Saved project " + boost::filesystem::path(path).filename().string());
+        return {{"saved", true}, {"path", path}, {"bytes", ec ? 0 : (uint64_t) bytes}};
+    }, /*timeout_s=*/120);
+    if (r.contains("error")) {
+        const std::string e = r["error"].get<std::string>();
+        return { e == "slicing" ? 409 : 422, r };
+    }
+    return { 200, r };
+}
+
 // DELETE /plates/{i} - the objects it held are not deleted: Plater::delete_plate
 // parks them beside the bed, as the toolbar does. The count is reported back.
 Response Controller::handle_delete_plate(int index)
@@ -2491,6 +2542,10 @@ Response Controller::dispatch(const Request &req)
             }
         }
         if (is("POST", "/api/v1/slice"))        return handle_slice();
+        if (is("POST", "/api/v1/project/save")) {
+            try { return handle_save_project(req.body); }
+            catch (const nlohmann::json::exception &) { return { 400, {{"error", "invalid_json"}} }; }
+        }
         if (is("GET",  "/api/v1/slice/status")) return handle_slice_status();
         if (is("POST", "/api/v1/slice/cancel")) return handle_slice_cancel();
         if (is("POST", "/api/v1/model")) {
@@ -2559,6 +2614,10 @@ Response Controller::dispatch(const Request &req)
                 if (idx < 0) return { 400, {{"error", "bad_plate_index"}} };
                 if (req.method == "DELETE" && action.empty())  return handle_delete_plate(idx);
                 if (req.method == "POST"   && action == "select") return handle_select_plate(idx);
+                if (req.method == "PUT"    && action.empty()) {
+                    try { return handle_rename_plate(idx, req.body); }
+                    catch (const nlohmann::json::exception &) { return { 400, {{"error", "invalid_json"}} }; }
+                }
                 return { 404, {{"error", "not_found"}} };
             }
         }

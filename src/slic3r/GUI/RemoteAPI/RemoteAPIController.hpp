@@ -70,6 +70,8 @@ private:
     Response handle_delete_object(uint64_t id);             // M4b: DELETE /objects/{id}
     Response handle_transform_object(uint64_t id, const std::string &body); // M4b: POST /objects/{id}/transform
     Response handle_cut_object(uint64_t id, const std::string &body); // POST /objects/{id}/cut
+    Response handle_rename_plate(int index, const std::string &body); // PUT /plates/{i} {"name"}
+    Response handle_save_project(const std::string &body);           // POST /project/save {"path"}
     Response handle_duplicate_object(uint64_t id);          // M4b: POST /objects/{id}/duplicate
     Response handle_put_object_config(uint64_t id, const std::string &body); // M4c: PUT /objects/{id}/config
     Response handle_arrange();                              // M4b: POST /arrange (async)
