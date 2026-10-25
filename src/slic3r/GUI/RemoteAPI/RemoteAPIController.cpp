@@ -961,6 +961,19 @@ static void current_plate_slice_stats(nlohmann::json &stats, nlohmann::json &war
                                 {"message", "A G-code path goes beyond the plate boundaries."},
                                 {"code", "TOOLPATH_OUTSIDE"}});
 
+        // G-code path conflict between two objects (the "Serious warning: Conflicts of G-code
+        // paths" notification in the window) - also only shown by the GCodeViewer, so it never
+        // reached res->warnings either. Same source: GCodeProcessorResult::conflict_result.
+        if (res->conflict_result) {
+            const auto &c = *res->conflict_result;
+            warnings.push_back({{"level", 3},
+                                {"code", "GCODE_PATH_CONFLICT"},
+                                {"message", "Conflicts of G-code paths at Z = " + std::to_string(c._height) +
+                                            " mm between " + c._objName1 + " and " + c._objName2},
+                                {"objects", {c._objName1, c._objName2}},
+                                {"z_mm", c._height}});
+        }
+
         // F14: per-feature (extrusion-role) breakdown for the slice-analytics MCP.
         // PrintEstimatedStatistics has no per-role TIME, so sum it per role from the
         // moves (Normal mode, index 0 - matches estimated_time_seconds). Filament comes
